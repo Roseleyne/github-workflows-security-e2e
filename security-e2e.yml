@@ -1,0 +1,300 @@
+name: Security E2E Pipeline
+
+# =============================================================================
+# Pipeline de Seguranca E2E totalmente automatizada
+# Alvo: Web + API + Mobile | Foco principal: AuthN/AuthZ + DevSecOps shift-left
+# Orquestrador: GitHub Actions
+#
+# Fluxo (fail-fast com gates de severidade):
+#   1. secrets-scan     -> Gitleaks (segredos no historico/diff)
+#   2. sast             -> Semgrep (analise estatica de codigo)
+#   3. sca              -> Trivy fs (dependencias vulneraveis) + SBOM
+#   4. iac-container    -> Trivy config + Trivy image (Dockerfile/IaC/imagem)
+#   5. deploy-ephemeral -> sobe stack web+api efemera (docker compose)
+#   6. authz-authn      -> suite pytest (IDOR, escalonamento, JWT, bypass)
+#   7. dast             -> OWASP ZAP baseline + API scan autenticado
+#   8. mobile-scan      -> MobSF estatico no artefato .apk
+#   9. security-gate    -> consolida resultados e falha o build por politica
+# =============================================================================
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1"   # varredura completa semanal (segunda 03:00 UTC)
+
+permissions:
+  contents: read
+  security-events: write   # upload de SARIF para a aba Security
+  actions: read
+
+env:
+  FAIL_ON_SEVERITY: "HIGH,CRITICAL"
+  APP_BASE_URL: "http://localhost:8080"
+  API_BASE_URL: "http://localhost:3000"
+
+concurrency:
+  group: sec-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 1. SECRETS SCAN
+  secrets-scan:
+    name: Secrets Scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          config-path: security/gitleaks.toml
+
+  # 2. SAST
+  sast:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    container:
+      image: returntocorp/semgrep:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Semgrep scan
+        run: |
+          semgrep scan \
+            --config security/semgrep-rules.yml \
+            --config "p/owasp-top-ten" \
+            --config "p/jwt" \
+            --config "p/secrets" \
+            --sarif --output semgrep.sarif || true
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sast-semgrep
+          path: semgrep.sarif
+
+  # 3. SCA + SBOM
+  sca:
+    name: SCA + SBOM (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy filesystem (deps)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-deps.sarif
+          severity: ${{ env.FAIL_ON_SEVERITY }}
+          ignore-unfixed: true
+      - name: Generate SBOM (CycloneDX)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: cyclonedx
+          output: sbom.cdx.json
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-deps.sarif
+          category: trivy-sca
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sca-trivy
+          path: |
+            trivy-deps.sarif
+            sbom.cdx.json
+
+  # 4. IaC + Container
+  iac-container:
+    name: IaC + Container (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy IaC/config misconfig
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: config
+          scan-ref: .
+          format: sarif
+          output: trivy-iac.sarif
+          severity: ${{ env.FAIL_ON_SEVERITY }}
+      - name: Build app image
+        run: docker build -t app-under-test:ci -f Dockerfile .
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: image
+          image-ref: app-under-test:ci
+          format: sarif
+          output: trivy-image.sarif
+          severity: ${{ env.FAIL_ON_SEVERITY }}
+          ignore-unfixed: true
+      - name: Upload SARIF (IaC)
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-iac.sarif
+          category: trivy-iac
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: iac-container
+          path: |
+            trivy-iac.sarif
+            trivy-image.sarif
+
+  # 5. DEPLOY EFEMERO
+  deploy-ephemeral:
+    name: Deploy ambiente efemero
+    runs-on: ubuntu-latest
+    needs: [sast, sca]
+    outputs:
+      ready: ${{ steps.health.outputs.ready }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Subir stack (docker compose)
+        run: docker compose -f docker-compose.test.yml up -d --build
+      - name: Aguardar healthcheck
+        id: health
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf "${API_BASE_URL}/health" && curl -sf "${APP_BASE_URL}"; then
+              echo "ready=true" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            sleep 5
+          done
+          echo "ready=false" >> "$GITHUB_OUTPUT"; exit 1
+
+  # 6. AUTHZ / AUTHN (foco principal)
+  authz-authn:
+    name: AuthZ/AuthN Tests (pytest)
+    runs-on: ubuntu-latest
+    needs: [deploy-ephemeral]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Instalar dependencias
+        run: pip install -r security/authz/requirements.txt
+      - name: Subir stack alvo
+        run: |
+          docker compose -f docker-compose.test.yml up -d --build
+          for i in $(seq 1 30); do curl -sf "${API_BASE_URL}/health" && break || sleep 5; done
+      - name: Executar suite AuthZ/AuthN
+        env:
+          APP_BASE_URL: ${{ env.APP_BASE_URL }}
+          API_BASE_URL: ${{ env.API_BASE_URL }}
+          USER_A_CREDS: ${{ secrets.TEST_USER_A }}
+          USER_B_CREDS: ${{ secrets.TEST_USER_B }}
+          ADMIN_CREDS: ${{ secrets.TEST_ADMIN }}
+          JWT_SECRET_GUESS: ${{ secrets.JWT_SECRET_GUESS }}
+        run: |
+          pytest security/authz \
+            -v --maxfail=0 \
+            --junitxml=authz-results.xml \
+            --html=authz-report.html --self-contained-html
+      - name: Publicar resultados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: authz-authn-results
+          path: |
+            authz-results.xml
+            authz-report.html
+
+  # 7. DAST (OWASP ZAP)
+  dast:
+    name: DAST (OWASP ZAP)
+    runs-on: ubuntu-latest
+    needs: [deploy-ephemeral]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Subir stack alvo
+        run: |
+          docker compose -f docker-compose.test.yml up -d --build
+          for i in $(seq 1 30); do curl -sf "${API_BASE_URL}/health" && break || sleep 5; done
+      - name: ZAP Baseline (passivo) - Web
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: ${{ env.APP_BASE_URL }}
+          rules_file_name: security/zap/rules.tsv
+          cmd_options: "-a"
+          allow_issue_writing: false
+      - name: ZAP API Scan (OpenAPI, autenticado)
+        uses: zaproxy/action-api-scan@v0.9.0
+        with:
+          target: ${{ env.API_BASE_URL }}/openapi.json
+          format: openapi
+          rules_file_name: security/zap/rules.tsv
+          allow_issue_writing: false
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dast-zap
+          path: |
+            report_html.html
+            report_md.md
+            report_json.json
+
+  # 8. MOBILE (MobSF)
+  mobile-scan:
+    name: Mobile SAST (MobSF)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Subir MobSF
+        run: |
+          docker run -d --name mobsf -p 8000:8000 \
+            -e MOBSF_API_KEY=${{ secrets.MOBSF_API_KEY }} \
+            opensecurity/mobile-security-framework-mobsf:latest
+          for i in $(seq 1 30); do curl -sf http://localhost:8000 && break || sleep 5; done
+      - name: Localizar APK
+        run: ls mobile/build/outputs/apk/release/app-release.apk
+      - name: Upload + scan via API MobSF
+        env:
+          MOBSF_API_KEY: ${{ secrets.MOBSF_API_KEY }}
+        run: bash security/mobile/mobsf_scan.sh mobile/build/outputs/apk/release/app-release.apk
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mobile-mobsf
+          path: security/mobile/mobsf-report.json
+
+  # 9. SECURITY GATE
+  security-gate:
+    name: Security Gate
+    runs-on: ubuntu-latest
+    needs: [secrets-scan, sast, sca, iac-container, authz-authn, dast, mobile-scan]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Avaliar politica de severidade
+        run: |
+          pip install -r security/authz/requirements.txt
+          python security/gate/evaluate_gate.py \
+            --artifacts artifacts \
+            --fail-on "${FAIL_ON_SEVERITY}" \
+            --summary "$GITHUB_STEP_SUMMARY"

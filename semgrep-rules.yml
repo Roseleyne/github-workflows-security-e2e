@@ -1,0 +1,27 @@
+rules:
+  - id: hardcoded-jwt-secret
+    languages: [python, javascript, typescript]
+    severity: ERROR
+    message: "Segredo de JWT hardcoded. Use cofre/variavel de ambiente."
+    patterns:
+      - pattern-either:
+          - pattern: jwt.encode(..., "...", ...)
+          - pattern: jwt.sign(..., "...", ...)
+  - id: missing-authz-decorator
+    languages: [python]
+    severity: WARNING
+    message: "Rota sensivel sem verificacao de autorizacao explicita."
+    patterns:
+      - pattern: |
+          @app.route($PATH, methods=[..., "DELETE", ...])
+          def $F(...):
+            ...
+      - pattern-not-inside: |
+          @requires_auth(...)
+          ...
+  - id: insecure-cookie
+    languages: [python, javascript, typescript]
+    severity: ERROR
+    message: "Cookie de sessao sem httponly/secure/samesite."
+    pattern-either:
+      - pattern: res.cookie($N, $V, {...})

@@ -1,0 +1,9 @@
+title = "Gitleaks - Security E2E"
+[extend]
+useDefault = true
+[[rules]]
+id = "generic-api-key"
+description = "Chave/segredo generico"
+regex = '''(?i)(api[_-]?key|secret|token|passwd|password)["'\s:=]{1,5}[0-9a-zA-Z\-_]{16,}'''
+[allowlist]
+paths = ['''security/authz/conftest\.py''', '''.*_test\.py''', '''docs/.*''']

@@ -1,0 +1,34 @@
+# Stack efemera para o cenario E2E (web + api + db).
+# Substitua as imagens pelas da sua aplicacao. Inclui seeds de contas de teste.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: testpass
+      POSTGRES_DB: appdb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 10
+
+  api:
+    build: { context: ., dockerfile: Dockerfile }
+    environment:
+      DATABASE_URL: postgres://postgres:testpass@db:5432/appdb
+      JWT_SECRET: ${JWT_SECRET:-please-override-in-vault}
+      SEED_TEST_USERS: "true"   # cria usera/userb/admin para a suite AuthZ
+    ports: ["3000:3000"]
+    depends_on:
+      db: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/health"]
+      interval: 5s
+      retries: 10
+
+  web:
+    build: { context: ./web, dockerfile: Dockerfile }
+    environment:
+      API_BASE_URL: http://api:3000
+    ports: ["8080:8080"]
+    depends_on:
+      api: { condition: service_healthy }
